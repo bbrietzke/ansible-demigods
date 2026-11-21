@@ -1,0 +1,91 @@
+---
+# ---------------------------------------------------------------------------
+# Cluster identity
+# ---------------------------------------------------------------------------
+cluster_name: demigods
+kube_context_name: demigods
+
+# ---------------------------------------------------------------------------
+# Versions
+# ---------------------------------------------------------------------------
+kubernetes_version: "1.37.2"
+kubernetes_minor: "1.37"
+kubernetes_package_version: "1.37.2-1.1"   # pkgs.k8s.io Debian revision
+kube_vip_version: "v1.3.1"
+kube_vip_image: "ghcr.io/kube-vip/kube-vip:{{ kube_vip_version }}"
+calico_version: "v3.33.1"
+# Kubernetes 1.36+ uses Calico's native projectcalico.org/v3 CRDs.
+calico_crd_manifest: "v3_projectcalico_org.yaml"
+calico_manifest_base: "https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests"
+containerd_min_major: 2                      # Kubernetes 1.37 needs containerd 2.x
+
+# ---------------------------------------------------------------------------
+# k8s0 network (behind OpenWRT)
+# ---------------------------------------------------------------------------
+network_name: k8s0
+network_prefix: "192.168.5"
+network_cidr: "192.168.5.0/26"
+network_netmask: "255.255.255.192"
+network_gateway: "192.168.5.1"
+network_dns: "192.168.5.1"
+dhcp_transient_start: 50
+dhcp_transient_end: 59
+
+# ---------------------------------------------------------------------------
+# Kubernetes networking
+# ---------------------------------------------------------------------------
+kube_vip_address: "192.168.5.5"
+kube_api_port: 6443
+control_plane_endpoint: "{{ kube_vip_address }}:{{ kube_api_port }}"
+pod_cidr: "10.253.0.0/23"
+pod_cidr_prefix: "10.253."
+pod_block_size: 26          # each node gets a /26 (64 addresses), 8 blocks total
+service_cidr: "172.16.30.0/23"     # 512 service IPs: API = .1, CoreDNS = 172.16.30.10
+service_api_ip: "172.16.30.1"      # first address: the kubernetes API service
+service_dns_ip: "172.16.30.10"     # tenth address: kube-dns (CoreDNS)
+cluster_dns_domain: cluster.local
+calico_ippool_name: demigods-pool
+calico_encapsulation: VXLANCrossSubnet   # same L2 segment -> native routing
+
+# ---------------------------------------------------------------------------
+# Node labels
+# ---------------------------------------------------------------------------
+topology_region: HOME
+topology_zone: DEMIGODS
+storage_label_key: demigods.home/storage-node
+
+# ---------------------------------------------------------------------------
+# Storage (Rook/Ceph)
+# ---------------------------------------------------------------------------
+storage_device: /dev/nvme0n1
+rook_data_dir: /var/lib/rook
+# Wiping is skipped once a node has been wiped (marker file), so re-runs never
+# destroy a live Ceph OSD. Set -e demigods_force_wipe=true to wipe again.
+demigods_force_wipe: false
+storage_wipe_marker: /etc/demigods/storage-wiped
+iscsi_iqn_prefix: "iqn.2026-11.home.demigods"
+
+# ---------------------------------------------------------------------------
+# OS updates
+# ---------------------------------------------------------------------------
+# Every run checks for OS updates and applies them. New nodes update in
+# parallel; cluster members update one at a time (drain/upgrade/reboot/uncordon).
+# Held packages (kubelet, kubeadm, kubectl) are never upgraded this way.
+demigods_os_updates: true
+demigods_apt_lock_timeout: 600     # seconds to wait for unattended-upgrades to release apt
+demigods_drain_timeout: 600s
+
+# ---------------------------------------------------------------------------
+# Verification
+# ---------------------------------------------------------------------------
+netcheck_namespace: demigods-netcheck
+netcheck_image: "docker.io/library/busybox:1.37"
+netcheck_keep: false         # true leaves the test DaemonSet running
+
+# ---------------------------------------------------------------------------
+# Paths on the nodes
+# ---------------------------------------------------------------------------
+demigods_conf_dir: /etc/demigods
+kubeadm_init_config: /etc/demigods/kubeadm-init.yaml
+kubeadm_join_config: /etc/demigods/kubeadm-join.yaml
+kube_vip_manifest: /etc/kubernetes/manifests/kube-vip.yaml

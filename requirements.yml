@@ -1,0 +1,4 @@
+---
+# Only ansible-core builtins are used by demigods.yml. This file exists so the
+# install step in the README is the same on every control machine.
+collections: []

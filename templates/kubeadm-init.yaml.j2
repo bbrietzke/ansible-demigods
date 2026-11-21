@@ -1,0 +1,51 @@
+# Managed by Ansible (demigods.yml) - kubeadm init configuration for {{ cluster_name }}
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: {{ node_ip }}
+  bindPort: {{ kube_api_port }}
+nodeRegistration:
+  name: {{ inventory_hostname }}
+  criSocket: unix:///run/containerd/containerd.sock
+  kubeletExtraArgs:
+    - name: node-ip
+      value: "{{ node_ip }}"
+    - name: node-labels
+      value: "topology.kubernetes.io/region={{ topology_region }},topology.kubernetes.io/zone={{ topology_zone }}"
+  ignorePreflightErrors:
+    # kube-vip's static pod is placed in the manifests directory before init.
+    - DirAvailable--etc-kubernetes-manifests
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+clusterName: {{ cluster_name }}
+kubernetesVersion: v{{ kubernetes_version }}
+controlPlaneEndpoint: "{{ control_plane_endpoint }}"
+networking:
+  podSubnet: {{ pod_cidr }}
+  serviceSubnet: {{ service_cidr }}
+  dnsDomain: {{ cluster_dns_domain }}
+apiServer:
+  certSANs:
+    - {{ kube_vip_address }}
+    - {{ node_ip }}
+    - {{ inventory_hostname }}
+    - {{ inventory_hostname }}.{{ network_name }}
+    - {{ cluster_name }}-api
+    - {{ cluster_name }}-api.{{ network_name }}
+controllerManager:
+  extraArgs:
+    # /23 cluster CIDR split into /26 per node -> room for 8 nodes.
+    - name: node-cidr-mask-size
+      value: "{{ pod_block_size }}"
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd
+failSwapOn: true
+serverTLSBootstrap: false
+---
+apiVersion: kubeproxy.config.k8s.io/v1alpha1
+kind: KubeProxyConfiguration
+mode: iptables
+clusterCIDR: {{ pod_cidr }}

@@ -1,0 +1,18 @@
+# Managed by Ansible (demigods.yml) - kubeadm join configuration for {{ inventory_hostname }}
+# Holds a bootstrap token, so it is removed after a successful join.
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: JoinConfiguration
+discovery:
+  bootstrapToken:
+    apiServerEndpoint: "{{ control_plane_endpoint }}"
+    token: "{{ hostvars[groups['control_plane'][0]]['demigods_join_token'] }}"
+    caCertHashes:
+      - "sha256:{{ hostvars[groups['control_plane'][0]]['demigods_ca_hash'] }}"
+nodeRegistration:
+  name: {{ inventory_hostname }}
+  criSocket: unix:///run/containerd/containerd.sock
+  kubeletExtraArgs:
+    - name: node-ip
+      value: "{{ node_ip }}"
+    - name: node-labels
+      value: "topology.kubernetes.io/region={{ topology_region }},topology.kubernetes.io/zone={{ topology_zone }}"

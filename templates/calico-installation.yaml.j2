@@ -1,0 +1,27 @@
+# Managed by Ansible (demigods.yml) - Calico {{ calico_version }} for {{ cluster_name }}
+# Only Installation is created. Goldmane and Whisker are separate operator
+# resources (operator.tigera.io/v1 Goldmane / Whisker) and are deliberately
+# NOT created, so neither component is deployed.
+apiVersion: operator.tigera.io/v1
+kind: Installation
+metadata:
+  name: default
+spec:
+  variant: Calico
+  cni:
+    type: Calico
+    ipam:
+      type: Calico
+  calicoNetwork:
+    bgp: Enabled
+    linuxDataplane: Iptables
+    nodeAddressAutodetectionV4:
+      cidrs:
+        - "{{ network_cidr }}"
+    ipPools:
+      - name: {{ calico_ippool_name }}
+        cidr: {{ pod_cidr }}
+        blockSize: {{ pod_block_size }}
+        encapsulation: {{ calico_encapsulation }}
+        natOutgoing: Enabled
+        nodeSelector: all()

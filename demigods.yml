@@ -1,0 +1,1321 @@
+---
+# =============================================================================
+# demigods.yml - builds the "demigods" Raspberry Pi 5 Kubernetes cluster
+#
+#   Play 0  Rolling OS updates   nodes already in the cluster, one at a time
+#                                (drain -> upgrade -> reboot if needed -> uncordon)
+#   Play 1  Prepare every node   preflight + network checks, OS updates (new
+#                                nodes, in parallel), OS, containerd,
+#                                Kubernetes packages, iSCSI, Rook/Ceph prep
+#   Play 2  Control plane        kube-vip, kubeadm init, Calico
+#   Play 3  Workers              kubeadm join through the kube-vip VIP
+#   Play 4  Finalize & verify    labels, Calico/IPAM checks, pod network test,
+#                                kubeconfig export
+#
+# Run:  ansible-playbook demigods.yml
+# See README.md for the full procedure.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# PLAY 0 - rolling OS updates for nodes that are already cluster members.
+# Fresh nodes are skipped here and updated in parallel early in Play 1.
+# -----------------------------------------------------------------------------
+- name: "Play 0 | Rolling OS updates for existing cluster members"
+  hosts: demigods
+  serial: 1
+  become: true
+  any_errors_fatal: true
+  gather_facts: false
+  tags: [updates]
+
+  tasks:
+    - name: Updates | is this node already in the cluster
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: demigods_member
+
+    - name: Updates | rolling update of a cluster member
+      when:
+        - demigods_os_updates | bool
+        - demigods_member.stat.exists
+      block:
+        - name: Updates | refresh package lists
+          ansible.builtin.apt:
+            update_cache: true
+            lock_timeout: "{{ demigods_apt_lock_timeout }}"
+
+        - name: Updates | list pending upgrades (held Kubernetes packages excluded)
+          ansible.builtin.shell: |
+            set -o pipefail
+            apt-get -s -o Debug::NoLocking=1 dist-upgrade | awk '/^Inst /{print $2}'
+          args:
+            executable: /bin/bash
+          register: demigods_pending
+          changed_when: false
+
+        - name: Updates | report
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }}: {{ demigods_pending.stdout_lines | length }} package(s) to upgrade
+              {{ ('- ' ~ (demigods_pending.stdout_lines | join(', '))) if demigods_pending.stdout_lines else '- up to date' }}
+
+        - name: Updates | drain, upgrade, reboot, uncordon
+          when: demigods_pending.stdout_lines | length > 0
+          block:
+            - name: "Updates | drain {{ inventory_hostname }}"
+              ansible.builtin.command: >-
+                kubectl drain {{ inventory_hostname }}
+                --ignore-daemonsets --delete-emptydir-data
+                --timeout={{ demigods_drain_timeout }}
+              delegate_to: "{{ groups['control_plane'][0] }}"
+              environment:
+                KUBECONFIG: /etc/kubernetes/admin.conf
+              changed_when: true
+
+            - name: Updates | upgrade packages
+              ansible.builtin.apt:
+                upgrade: dist
+                autoremove: true
+                lock_timeout: "{{ demigods_apt_lock_timeout }}"
+
+            - name: Updates | is a reboot required
+              ansible.builtin.stat:
+                path: /var/run/reboot-required
+              register: demigods_reboot_required
+
+            - name: Updates | reboot
+              ansible.builtin.reboot:
+                reboot_timeout: 900
+                msg: "demigods.yml: OS updates"
+              when: demigods_reboot_required.stat.exists
+
+            - name: Updates | API answers again
+              ansible.builtin.command: kubectl get --raw /readyz
+              delegate_to: "{{ groups['control_plane'][0] }}"
+              environment:
+                KUBECONFIG: /etc/kubernetes/admin.conf
+              register: demigods_upd_readyz
+              until: demigods_upd_readyz.rc == 0 and demigods_upd_readyz.stdout == 'ok'
+              retries: 60
+              delay: 5
+              changed_when: false
+
+            - name: "Updates | {{ inventory_hostname }} Ready"
+              ansible.builtin.command: "kubectl wait --for=condition=Ready node/{{ inventory_hostname }} --timeout=600s"
+              delegate_to: "{{ groups['control_plane'][0] }}"
+              environment:
+                KUBECONFIG: /etc/kubernetes/admin.conf
+              changed_when: false
+
+            - name: "Updates | uncordon {{ inventory_hostname }}"
+              ansible.builtin.command: "kubectl uncordon {{ inventory_hostname }}"
+              delegate_to: "{{ groups['control_plane'][0] }}"
+              environment:
+                KUBECONFIG: /etc/kubernetes/admin.conf
+              changed_when: true
+
+# -----------------------------------------------------------------------------
+# PLAY 1 - every node
+# -----------------------------------------------------------------------------
+- name: "Play 1 | Prepare demigods nodes"
+  hosts: demigods
+  become: true
+  any_errors_fatal: true
+  gather_facts: true
+
+  handlers:
+    - name: Restart containerd
+      ansible.builtin.systemd_service:
+        name: containerd
+        state: restarted
+
+    - name: Restart iscsid
+      ansible.builtin.systemd_service:
+        name: iscsid
+        state: restarted
+
+  tasks:
+    # =========================================================================
+    # PREFLIGHT - inventory sanity and network verification
+    # =========================================================================
+    - name: Preflight | inventory sanity
+      tags: [preflight, always]
+      run_once: true
+      block:
+        - name: Preflight | exactly one control plane, four workers
+          ansible.builtin.assert:
+            that:
+              - groups['control_plane'] | length == 1
+              - groups['workers'] | length == 4
+            fail_msg: "Expected 1 control plane and 4 workers in the inventory."
+
+        - name: Preflight | storage nodes are workers only
+          ansible.builtin.assert:
+            that:
+              - not (hostvars[item].storage_node | bool) or item in groups['workers']
+            fail_msg: "{{ item }} is marked as a storage node but is not a worker."
+          loop: "{{ groups['demigods'] }}"
+
+        - name: Preflight | static addresses fit k8s0 and avoid the DHCP pool, gateway and VIP
+          ansible.builtin.assert:
+            that:
+              - (hostvars[item].ip_octet | int) > 1
+              - (hostvars[item].ip_octet | int) < 63
+              - (hostvars[item].ip_octet | int) < dhcp_transient_start
+                or (hostvars[item].ip_octet | int) > dhcp_transient_end
+              - hostvars[item].node_ip != network_gateway
+              - hostvars[item].node_ip != kube_vip_address
+            fail_msg: "{{ item }} ({{ hostvars[item].node_ip }}) is not a valid static address on {{ network_cidr }}."
+          loop: "{{ groups['demigods'] }}"
+
+        - name: Preflight | VIP sits in k8s0 outside the DHCP pool
+          ansible.builtin.assert:
+            that:
+              - kube_vip_address.startswith(network_prefix ~ '.')
+              - (kube_vip_address.split('.')[-1] | int) < dhcp_transient_start
+                or (kube_vip_address.split('.')[-1] | int) > dhcp_transient_end
+
+        - name: Preflight | addresses and MACs are unique
+          ansible.builtin.assert:
+            that:
+              - groups['demigods'] | map('extract', hostvars, 'node_ip') | unique | length == 5
+              - groups['demigods'] | map('extract', hostvars, 'mac_address') | map('lower') | unique | length == 5
+
+    - name: Preflight | host checks
+      tags: [preflight, always]
+      block:
+        - name: Preflight | ARM64
+          ansible.builtin.assert:
+            that: ansible_architecture == 'aarch64'
+            fail_msg: "{{ inventory_hostname }} is {{ ansible_architecture }}, expected aarch64."
+
+        - name: Preflight | Ubuntu
+          ansible.builtin.assert:
+            that: ansible_distribution == 'Ubuntu'
+            fail_msg: "This playbook targets Ubuntu Server (26.04 LTS arm64)."
+
+        - name: Preflight | warn if not Ubuntu 26.04
+          ansible.builtin.debug:
+            msg: "Note: {{ inventory_hostname }} runs Ubuntu {{ ansible_distribution_version }}; tested target is 26.04."
+          when: ansible_distribution_version != '26.04'
+
+        - name: Preflight | remember the primary interface
+          ansible.builtin.set_fact:
+            demigods_iface: "{{ ansible_default_ipv4.interface }}"
+
+        - name: "Preflight | network | address is {{ node_ip }}"
+          ansible.builtin.assert:
+            that: ansible_default_ipv4.address == node_ip
+            fail_msg: >-
+              {{ inventory_hostname }} has {{ ansible_default_ipv4.address }} on {{ demigods_iface }},
+              expected {{ node_ip }}. Check the OpenWRT static lease for {{ mac_address }}.
+
+        - name: "Preflight | network | MAC is {{ mac_address }}"
+          ansible.builtin.assert:
+            that: (ansible_default_ipv4.macaddress | lower) == (mac_address | lower)
+            fail_msg: >-
+              {{ inventory_hostname }} answers with MAC {{ ansible_default_ipv4.macaddress }},
+              inventory says {{ mac_address }}. The wrong Pi may be on this address.
+
+        - name: "Preflight | network | netmask is {{ network_netmask }} (/26)"
+          ansible.builtin.assert:
+            that: ansible_default_ipv4.netmask == network_netmask
+
+        - name: "Preflight | network | default gateway is {{ network_gateway }}"
+          ansible.builtin.assert:
+            that: ansible_default_ipv4.gateway == network_gateway
+
+        - name: Preflight | network | DNS servers handed out by DHCP
+          ansible.builtin.command: "resolvectl dns {{ demigods_iface }}"
+          register: demigods_resolvectl
+          changed_when: false
+          failed_when: false
+
+        - name: "Preflight | network | DNS server is {{ network_dns }}"
+          ansible.builtin.assert:
+            that: network_dns in demigods_resolvectl.stdout
+            fail_msg: "DNS on {{ demigods_iface }} is '{{ demigods_resolvectl.stdout }}', expected {{ network_dns }}."
+          when: demigods_resolvectl.rc == 0
+
+        - name: Preflight | network | gateway answers ping
+          ansible.builtin.command: "ping -c 2 -W 2 {{ network_gateway }}"
+          changed_when: false
+
+        - name: Preflight | network | name resolution works
+          ansible.builtin.command: "getent hosts {{ item }}"
+          loop: [pkgs.k8s.io, ghcr.io, raw.githubusercontent.com]
+          changed_when: false
+
+        - name: Preflight | network | every other demigod answers ping
+          ansible.builtin.command: "ping -c 2 -W 2 {{ hostvars[item].node_ip }}"
+          loop: "{{ groups['demigods'] | difference([inventory_hostname]) }}"
+          changed_when: false
+
+        - name: Preflight | storage | NVMe device present on storage nodes
+          ansible.builtin.stat:
+            path: "{{ storage_device }}"
+          register: demigods_nvme_stat
+          when: storage_node | bool
+
+        - name: Preflight | storage | assert NVMe is a block device
+          ansible.builtin.assert:
+            that:
+              - demigods_nvme_stat.stat.exists
+              - demigods_nvme_stat.stat.isblk
+            fail_msg: >-
+              {{ storage_device }} not found on {{ inventory_hostname }}. Check the NVMe HAT and that
+              PCIe is enabled (dtparam=pciex1 in /boot/firmware/config.txt) if the HAT has no EEPROM.
+          when: storage_node | bool
+
+    # =========================================================================
+    # OS UPDATES - nodes not yet in the cluster (in parallel)
+    # Cluster members were already handled, one at a time, by Play 0.
+    # =========================================================================
+    - name: Updates | new nodes
+      tags: [updates]
+      when: demigods_os_updates | bool
+      block:
+        - name: Updates | is this node already in the cluster
+          ansible.builtin.stat:
+            path: /etc/kubernetes/kubelet.conf
+          register: demigods_member_p1
+
+        - name: Updates | update a node that is not yet a member
+          when: not demigods_member_p1.stat.exists
+          block:
+            - name: Updates | refresh package lists
+              ansible.builtin.apt:
+                update_cache: true
+                lock_timeout: "{{ demigods_apt_lock_timeout }}"
+
+            - name: Updates | list pending upgrades
+              ansible.builtin.shell: |
+                set -o pipefail
+                apt-get -s -o Debug::NoLocking=1 dist-upgrade | awk '/^Inst /{print $2}'
+              args:
+                executable: /bin/bash
+              register: demigods_pending_p1
+              changed_when: false
+
+            - name: Updates | report
+              ansible.builtin.debug:
+                msg: >-
+                  {{ inventory_hostname }}: {{ demigods_pending_p1.stdout_lines | length }} package(s) to upgrade
+                  {{ ('- ' ~ (demigods_pending_p1.stdout_lines | join(', '))) if demigods_pending_p1.stdout_lines else '- up to date' }}
+
+            - name: Updates | upgrade packages
+              ansible.builtin.apt:
+                upgrade: dist
+                autoremove: true
+                lock_timeout: "{{ demigods_apt_lock_timeout }}"
+              when: demigods_pending_p1.stdout_lines | length > 0
+
+            - name: Updates | is a reboot required
+              ansible.builtin.stat:
+                path: /var/run/reboot-required
+              register: demigods_reboot_required_p1
+
+            - name: Updates | reboot
+              ansible.builtin.reboot:
+                reboot_timeout: 900
+                msg: "demigods.yml: OS updates"
+              when: demigods_reboot_required_p1.stat.exists
+
+            - name: Updates | refresh facts after reboot (new kernel)
+              ansible.builtin.setup:
+              when: demigods_reboot_required_p1.stat.exists
+
+    # =========================================================================
+    # OS PREPARATION
+    # =========================================================================
+    - name: OS | base configuration
+      tags: [os]
+      block:
+        - name: OS | stop cloud-init from overwriting hostname and /etc/hosts
+          ansible.builtin.copy:
+            dest: /etc/cloud/cloud.cfg.d/99-demigods.cfg
+            mode: "0644"
+            content: |
+              # Managed by Ansible (demigods.yml)
+              preserve_hostname: true
+              manage_etc_hosts: false
+
+        - name: OS | set hostname
+          ansible.builtin.hostname:
+            name: "{{ inventory_hostname }}"
+
+        - name: OS | /etc/hosts entries for every demigod and the API VIP
+          ansible.builtin.blockinfile:
+            path: /etc/hosts
+            marker: "# {mark} DEMIGODS ({{ network_name }}) - managed by Ansible"
+            block: |
+              {{ kube_vip_address }} {{ cluster_name }}-api.{{ network_name }} {{ cluster_name }}-api
+              {% for h in groups['demigods'] %}
+              {{ hostvars[h].node_ip }} {{ h }}.{{ network_name }} {{ h }}
+              {% endfor %}
+
+        - name: OS | install base packages
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: 3600
+            name:
+              - apt-transport-https
+              - ca-certificates
+              - curl
+              - gpg
+              - jq
+              - python3-debian
+              - chrony
+              - conntrack
+              - socat
+              - ethtool
+              - ipset
+              - iptables
+              - containerd
+              - runc
+              # Rook/Ceph + iSCSI prerequisites
+              - lvm2
+              - gdisk
+              - parted
+              - nvme-cli
+              - open-iscsi
+              - nfs-common
+
+        - name: OS | kernel module extras for this kernel (rbd, ceph, iscsi_tcp)
+          ansible.builtin.apt:
+            name: "linux-modules-extra-{{ ansible_kernel }}"
+          register: demigods_mod_extra
+          failed_when: false
+
+        - name: OS | kernel module extras meta-package (fallback)
+          ansible.builtin.apt:
+            name: linux-modules-extra-raspi
+          when: (demigods_mod_extra.msg | default('')) is search('No package|Unable to locate|not found')
+          failed_when: false
+
+        - name: OS | chrony running (Ceph needs synced clocks)
+          ansible.builtin.systemd_service:
+            name: chrony
+            enabled: true
+            state: started
+
+        - name: OS | check for ufw
+          ansible.builtin.stat:
+            path: /usr/sbin/ufw
+          register: demigods_ufw
+
+        - name: OS | disable ufw (cluster traffic stays on the isolated k8s0 network)
+          ansible.builtin.command: ufw disable
+          when: demigods_ufw.stat.exists
+          register: demigods_ufw_off
+          changed_when: "'disabled' in demigods_ufw_off.stdout"
+
+        # --- swap -------------------------------------------------------------
+        - name: OS | swap off now
+          ansible.builtin.command: swapoff -a
+          when: ansible_swaptotal_mb | int > 0
+          changed_when: true
+
+        - name: OS | remove swap from fstab
+          ansible.builtin.replace:
+            path: /etc/fstab
+            regexp: '^([^#\n]*\sswap\s.*)$'
+            replace: '# \1  # disabled by demigods.yml'
+
+        - name: OS | mask zram swap units if present
+          ansible.builtin.systemd_service:
+            name: "{{ item }}"
+            masked: true
+            state: stopped
+          loop: [systemd-zram-setup@zram0.service, swap.target]
+          failed_when: false
+
+        # --- cgroups ----------------------------------------------------------
+        - name: OS | enable the memory cgroup on the Pi kernel command line
+          ansible.builtin.replace:
+            path: /boot/firmware/cmdline.txt
+            regexp: '^((?!.*cgroup_enable=memory).*\S)\s*$'
+            replace: '\1 cgroup_enable=memory cgroup_memory=1'
+          register: demigods_cmdline
+
+        - name: OS | reboot to apply kernel command line
+          ansible.builtin.reboot:
+            reboot_timeout: 900
+            msg: "demigods.yml: enabling memory cgroup"
+          when: demigods_cmdline is changed
+
+        - name: OS | read cgroup v2 controllers
+          ansible.builtin.slurp:
+            src: /sys/fs/cgroup/cgroup.controllers
+          register: demigods_cgroups
+
+        - name: OS | assert cgroup v2 with memory controller (required by Kubernetes 1.37)
+          ansible.builtin.assert:
+            that: "'memory' in (demigods_cgroups.content | b64decode)"
+            fail_msg: "cgroup v2 memory controller missing on {{ inventory_hostname }}."
+
+        # --- kernel modules & sysctl -----------------------------------------
+        - name: OS | modules to load at boot
+          ansible.builtin.copy:
+            dest: /etc/modules-load.d/demigods.conf
+            mode: "0644"
+            content: |
+              # Managed by Ansible (demigods.yml)
+              # Kubernetes / containerd
+              overlay
+              br_netfilter
+              # Rook/Ceph and iSCSI
+              rbd
+              ceph
+              nbd
+              iscsi_tcp
+              dm_crypt
+
+        - name: OS | load required modules now
+          ansible.builtin.command: "modprobe {{ item }}"
+          loop: [overlay, br_netfilter, rbd, ceph, iscsi_tcp]
+          changed_when: false
+
+        - name: OS | load optional modules now
+          ansible.builtin.command: "modprobe {{ item }}"
+          loop: [nbd, dm_crypt]
+          changed_when: false
+          failed_when: false
+
+        - name: OS | Kubernetes sysctls
+          ansible.builtin.copy:
+            dest: /etc/sysctl.d/99-demigods-kubernetes.conf
+            mode: "0644"
+            content: |
+              # Managed by Ansible (demigods.yml)
+              net.bridge.bridge-nf-call-iptables  = 1
+              net.bridge.bridge-nf-call-ip6tables = 1
+              net.ipv4.ip_forward                 = 1
+              fs.inotify.max_user_instances       = 8192
+              fs.inotify.max_user_watches         = 524288
+          register: demigods_sysctl
+
+        - name: OS | apply sysctls
+          ansible.builtin.command: sysctl --system
+          when: demigods_sysctl is changed
+          changed_when: true
+
+    # =========================================================================
+    # KUBERNETES PACKAGES
+    # =========================================================================
+    - name: Kubernetes | packages
+      tags: [kubernetes]
+      block:
+        - name: "Kubernetes | pkgs.k8s.io v{{ kubernetes_minor }} repository"
+          ansible.builtin.deb822_repository:
+            name: kubernetes
+            types: [deb]
+            uris: "https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_minor }}/deb/"
+            suites: ["/"]
+            signed_by: "https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_minor }}/deb/Release.key"
+            state: present
+
+        - name: "Kubernetes | install kubelet, kubeadm, kubectl {{ kubernetes_package_version }}"
+          ansible.builtin.apt:
+            update_cache: true
+            allow_change_held_packages: true
+            name:
+              - "kubelet={{ kubernetes_package_version }}"
+              - "kubeadm={{ kubernetes_package_version }}"
+              - "kubectl={{ kubernetes_package_version }}"
+
+        - name: Kubernetes | hold packages at this version
+          ansible.builtin.dpkg_selections:
+            name: "{{ item }}"
+            selection: hold
+          loop: [kubelet, kubeadm, kubectl]
+
+        - name: Kubernetes | kubelet enabled (it restarts until kubeadm configures it)
+          ansible.builtin.systemd_service:
+            name: kubelet
+            enabled: true
+
+    # =========================================================================
+    # CONTAINERD
+    # =========================================================================
+    - name: containerd | runtime
+      tags: [containerd]
+      block:
+        - name: containerd | version
+          ansible.builtin.shell: |
+            set -o pipefail
+            containerd --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1
+          args:
+            executable: /bin/bash
+          register: demigods_containerd_version
+          changed_when: false
+
+        - name: "containerd | assert >= {{ containerd_min_major }}.x"
+          ansible.builtin.assert:
+            that:
+              - demigods_containerd_version.stdout | length > 0
+              - (demigods_containerd_version.stdout.split('.') | first | int) >= (containerd_min_major | int)
+            fail_msg: >-
+              Kubernetes {{ kubernetes_version }} needs containerd {{ containerd_min_major }}.x or newer;
+              found '{{ demigods_containerd_version.stdout }}'
+            success_msg: "containerd {{ demigods_containerd_version.stdout }}"
+
+        - name: containerd | config directory
+          ansible.builtin.file:
+            path: /etc/containerd
+            state: directory
+            mode: "0755"
+
+        - name: containerd | is config managed already
+          ansible.builtin.command: grep -q '^# managed-by demigods' /etc/containerd/config.toml
+          register: demigods_ctd_managed
+          changed_when: false
+          failed_when: false
+
+        - name: containerd | generate default config
+          ansible.builtin.shell: |
+            set -o pipefail
+            { echo '# managed-by demigods (generated from containerd config default)'; containerd config default; } \
+              > /etc/containerd/config.toml
+          args:
+            executable: /bin/bash
+          when: demigods_ctd_managed.rc != 0
+          changed_when: true
+          notify: Restart containerd
+
+        - name: containerd | systemd cgroup driver for runc
+          ansible.builtin.lineinfile:
+            path: /etc/containerd/config.toml
+            regexp: '^\s*SystemdCgroup\s*='
+            line: "            SystemdCgroup = true"
+            insertafter: "runtimes.runc.options\\]"
+          notify: Restart containerd
+
+        - name: containerd | pause image kubeadm expects
+          ansible.builtin.shell: |
+            set -o pipefail
+            kubeadm config images list --kubernetes-version v{{ kubernetes_version }} | grep '/pause:'
+          args:
+            executable: /bin/bash
+          register: demigods_pause_image
+          changed_when: false
+
+        - name: containerd | align sandbox image with kubeadm
+          ansible.builtin.replace:
+            path: /etc/containerd/config.toml
+            regexp: '^(\s*sandbox(?:_image)?\s*=\s*).*$'
+            replace: "\\1'{{ demigods_pause_image.stdout | trim }}'"
+          notify: Restart containerd
+
+        - name: containerd | crictl endpoint
+          ansible.builtin.copy:
+            dest: /etc/crictl.yaml
+            mode: "0644"
+            content: |
+              runtime-endpoint: unix:///run/containerd/containerd.sock
+              image-endpoint: unix:///run/containerd/containerd.sock
+              timeout: 10
+
+        - name: containerd | enabled and running
+          ansible.builtin.systemd_service:
+            name: containerd
+            enabled: true
+            state: started
+
+    # =========================================================================
+    # STORAGE - iSCSI initiator + Rook/Ceph disk preparation
+    # =========================================================================
+    - name: Storage | iSCSI initiator
+      tags: [storage]
+      block:
+        - name: Storage | IQN derived from hostname
+          ansible.builtin.set_fact:
+            demigods_iqn: "{{ iscsi_iqn_prefix }}:{{ inventory_hostname | lower }}"
+
+        - name: Storage | IQNs are unique across the cluster
+          ansible.builtin.assert:
+            that: groups['demigods'] | map('extract', hostvars, 'demigods_iqn') | unique | length == groups['demigods'] | length
+          run_once: true
+
+        - name: "Storage | /etc/iscsi/initiatorname.iscsi"
+          ansible.builtin.copy:
+            dest: /etc/iscsi/initiatorname.iscsi
+            mode: "0600"
+            content: |
+              ## Managed by Ansible (demigods.yml) - derived from hostname {{ inventory_hostname }}
+              InitiatorName={{ demigods_iqn }}
+          notify: Restart iscsid
+
+        - name: Storage | iscsid enabled
+          ansible.builtin.systemd_service:
+            name: iscsid
+            enabled: true
+            state: started
+
+    - name: Storage | Rook/Ceph host state
+      tags: [storage]
+      block:
+        - name: Storage | is this node already in a cluster
+          ansible.builtin.stat:
+            path: /etc/kubernetes/kubelet.conf
+          register: demigods_kubelet_conf
+
+        - name: "Storage | clear stale Rook data dir {{ rook_data_dir }} on fresh nodes"
+          ansible.builtin.file:
+            path: "{{ rook_data_dir }}"
+            state: absent
+          when: not demigods_kubelet_conf.stat.exists
+
+    - name: Storage | wipe NVMe for Ceph
+      tags: [storage]
+      when: storage_node | bool
+      block:
+        - name: Storage | device holding /
+          ansible.builtin.shell: |
+            set -o pipefail
+            src=$(findmnt -n -o SOURCE /)
+            lsblk -no PKNAME "$src" 2>/dev/null || echo "$src"
+          args:
+            executable: /bin/bash
+          register: demigods_root_parent
+          changed_when: false
+
+        - name: "Storage | mounts on {{ storage_device }}"
+          ansible.builtin.command: "lsblk -nr -o MOUNTPOINTS {{ storage_device }}"
+          register: demigods_nvme_mounts
+          changed_when: false
+
+        - name: "Storage | refuse to wipe if {{ storage_device }} is in use by the OS"
+          ansible.builtin.assert:
+            that:
+              - (storage_device | basename) not in demigods_root_parent.stdout
+              - demigods_nvme_mounts.stdout | trim | length == 0
+            fail_msg: >-
+              {{ storage_device }} on {{ inventory_hostname }} holds the root filesystem or is mounted
+              ({{ demigods_nvme_mounts.stdout | trim }}). Boot from SD/USB, not the NVMe.
+
+        - name: Storage | wipe marker
+          ansible.builtin.stat:
+            path: "{{ storage_wipe_marker }}"
+          register: demigods_wipe_marker
+
+        - name: Storage | decide whether to wipe
+          ansible.builtin.set_fact:
+            demigods_do_wipe: "{{ (not demigods_wipe_marker.stat.exists) or (demigods_force_wipe | bool) }}"
+
+        - name: Storage | skip notice
+          ansible.builtin.debug:
+            msg: >-
+              {{ storage_device }} was wiped previously ({{ storage_wipe_marker }}); leaving it alone so a
+              live Ceph OSD is not destroyed. Use -e demigods_force_wipe=true to wipe again.
+          when: not demigods_do_wipe
+
+        - name: Storage | wipe
+          when: demigods_do_wipe
+          block:
+            - name: Storage | remove Ceph device-mapper / LVM leftovers
+              ansible.builtin.shell: |
+                set -o pipefail
+                for vg in $(vgs --noheadings -o vg_name 2>/dev/null | awk '/ceph-/{print $1}'); do
+                  vgremove -f -y "$vg"
+                done
+                for dm in $(dmsetup ls 2>/dev/null | awk '/^ceph--/{print $1}'); do
+                  dmsetup remove -f "$dm"
+                done
+                pvremove -ff -y {{ storage_device }} 2>/dev/null || true
+              args:
+                executable: /bin/bash
+              changed_when: true
+
+            - name: Storage | zap GPT and MBR
+              ansible.builtin.command: "sgdisk --zap-all {{ storage_device }}"
+              changed_when: true
+
+            - name: Storage | remove all filesystem / RAID / LVM signatures
+              ansible.builtin.command: "wipefs --all --force {{ storage_device }}"
+              changed_when: true
+
+            - name: Storage | zero the first 100 MiB
+              ansible.builtin.command: "dd if=/dev/zero of={{ storage_device }} bs=1M count=100 oflag=direct,dsync"
+              changed_when: true
+
+            - name: Storage | discard all blocks (TRIM)
+              ansible.builtin.command: "blkdiscard -f {{ storage_device }}"
+              changed_when: true
+              failed_when: false
+
+            - name: Storage | re-read partition table
+              ansible.builtin.command: "partprobe {{ storage_device }}"
+              changed_when: false
+              failed_when: false
+
+            - name: Storage | no partitions remain
+              ansible.builtin.command: "lsblk -nr -o NAME,TYPE {{ storage_device }}"
+              register: demigods_lsblk_after
+              changed_when: false
+
+            - name: Storage | no signatures remain
+              ansible.builtin.command: "blkid -p {{ storage_device }}"
+              register: demigods_blkid_after
+              changed_when: false
+              failed_when: false
+
+            - name: Storage | assert disk is clean
+              ansible.builtin.assert:
+                that:
+                  - demigods_lsblk_after.stdout_lines | length == 1
+                  - demigods_blkid_after.rc == 2
+                fail_msg: "{{ storage_device }} still has partitions or signatures: {{ demigods_lsblk_after.stdout }} {{ demigods_blkid_after.stdout }}"
+
+            - name: Storage | marker directory
+              ansible.builtin.file:
+                path: "{{ demigods_conf_dir }}"
+                state: directory
+                mode: "0755"
+
+            - name: Storage | write wipe marker
+              ansible.builtin.copy:
+                dest: "{{ storage_wipe_marker }}"
+                mode: "0644"
+                content: "{{ storage_device }} wiped for Rook/Ceph by demigods.yml\n"
+
+    - name: Flush handlers before Kubernetes bootstrap
+      ansible.builtin.meta: flush_handlers
+
+# -----------------------------------------------------------------------------
+# PLAY 2 - control plane (hercules)
+# -----------------------------------------------------------------------------
+- name: "Play 2 | Bootstrap the control plane"
+  hosts: control_plane
+  become: true
+  any_errors_fatal: true
+  gather_facts: false
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+
+  tasks:
+    - name: Control plane | bootstrap
+      tags: [control_plane]
+      block:
+        - name: Control plane | config directory
+          ansible.builtin.file:
+            path: "{{ demigods_conf_dir }}"
+            state: directory
+            mode: "0700"
+
+        - name: Control plane | already initialised?
+          ansible.builtin.stat:
+            path: /etc/kubernetes/admin.conf
+          register: demigods_admin_conf
+
+        - name: Control plane | VIP must be free before first init
+          ansible.builtin.command: "ping -c 2 -W 1 {{ kube_vip_address }}"
+          register: demigods_vip_ping
+          changed_when: false
+          failed_when: demigods_vip_ping.rc == 0
+          when: not demigods_admin_conf.stat.exists
+
+        # --- kube-vip ---------------------------------------------------------
+        - name: kube-vip | static pod directory
+          ansible.builtin.file:
+            path: /etc/kubernetes/manifests
+            state: directory
+            mode: "0755"
+
+        - name: kube-vip | current manifest image
+          ansible.builtin.command: "grep -c '{{ kube_vip_image }}' {{ kube_vip_manifest }}"
+          register: demigods_kv_current
+          changed_when: false
+          failed_when: false
+
+        - name: kube-vip | generate manifest
+          when: demigods_kv_current.rc != 0
+          block:
+            - name: "kube-vip | pull {{ kube_vip_image }}"
+              ansible.builtin.command: "ctr image pull {{ kube_vip_image }}"
+              changed_when: true
+
+            - name: kube-vip | render ARP control-plane manifest
+              ansible.builtin.command: >-
+                ctr run --rm --net-host {{ kube_vip_image }} kube-vip-manifest-gen
+                /kube-vip manifest pod
+                --interface {{ demigods_iface }}
+                --address {{ kube_vip_address }}
+                --controlplane
+                --arp
+                --leaderElection
+              register: demigods_kv_manifest
+              changed_when: false
+
+            - name: kube-vip | write static pod manifest
+              ansible.builtin.copy:
+                dest: "{{ kube_vip_manifest }}"
+                content: "{{ demigods_kv_manifest.stdout }}\n"
+                mode: "0600"
+
+        - name: kube-vip | use super-admin.conf while kubeadm bootstraps (Kubernetes 1.29+)
+          ansible.builtin.replace:
+            path: "{{ kube_vip_manifest }}"
+            regexp: 'path: /etc/kubernetes/admin.conf'
+            replace: 'path: /etc/kubernetes/super-admin.conf'
+          when: not demigods_admin_conf.stat.exists
+
+        # --- kubeadm init -----------------------------------------------------
+        - name: kubeadm | render init configuration
+          ansible.builtin.template:
+            src: templates/kubeadm-init.yaml.j2
+            dest: "{{ kubeadm_init_config }}"
+            mode: "0600"
+
+        - name: kubeadm | validate configuration
+          ansible.builtin.command: "kubeadm config validate --config {{ kubeadm_init_config }}"
+          changed_when: false
+
+        - name: kubeadm | pre-pull control plane images
+          ansible.builtin.command: "kubeadm config images pull --config {{ kubeadm_init_config }}"
+          when: not demigods_admin_conf.stat.exists
+          changed_when: true
+
+        - name: "kubeadm | init cluster {{ cluster_name }}"
+          ansible.builtin.command: "kubeadm init --config {{ kubeadm_init_config }}"
+          when: not demigods_admin_conf.stat.exists
+          register: demigods_kubeadm_init
+          changed_when: true
+
+        - name: kube-vip | switch back to admin.conf after bootstrap
+          ansible.builtin.replace:
+            path: "{{ kube_vip_manifest }}"
+            regexp: 'path: /etc/kubernetes/super-admin.conf'
+            replace: 'path: /etc/kubernetes/admin.conf'
+
+        - name: "Control plane | API answers on the VIP {{ control_plane_endpoint }}"
+          ansible.builtin.wait_for:
+            host: "{{ kube_vip_address }}"
+            port: "{{ kube_api_port }}"
+            timeout: 300
+
+        - name: Control plane | API is ready
+          ansible.builtin.command: kubectl get --raw /readyz
+          register: demigods_readyz
+          until: demigods_readyz.rc == 0 and demigods_readyz.stdout == 'ok'
+          retries: 60
+          delay: 5
+          changed_when: false
+
+        - name: Control plane | kubeconfig for the login user
+          ansible.builtin.shell: |
+            set -o pipefail
+            home=$(getent passwd {{ ansible_user }} | cut -d: -f6)
+            install -d -m 0700 -o {{ ansible_user }} -g {{ ansible_user }} "$home/.kube"
+            install -m 0600 -o {{ ansible_user }} -g {{ ansible_user }} /etc/kubernetes/admin.conf "$home/.kube/config"
+          args:
+            executable: /bin/bash
+          changed_when: false
+
+    # --- Calico -------------------------------------------------------------
+    - name: Calico | CNI
+      tags: [calico]
+      block:
+        - name: Calico | manifest directory
+          ansible.builtin.file:
+            path: "{{ demigods_conf_dir }}/calico"
+            state: directory
+            mode: "0700"
+
+        - name: "Calico | download {{ calico_version }} CRDs and operator"
+          ansible.builtin.get_url:
+            url: "{{ calico_manifest_base }}/{{ item }}"
+            dest: "{{ demigods_conf_dir }}/calico/{{ item }}"
+            mode: "0600"
+          loop:
+            - "{{ calico_crd_manifest }}"
+            - tigera-operator.yaml
+
+        - name: Calico | apply CRDs
+          ansible.builtin.command: >-
+            kubectl apply --server-side --force-conflicts
+            -f {{ demigods_conf_dir }}/calico/{{ calico_crd_manifest }}
+          changed_when: false   # server-side apply reports every object; not a useful change signal
+
+        - name: Calico | apply Tigera operator
+          ansible.builtin.command: >-
+            kubectl apply --server-side --force-conflicts
+            -f {{ demigods_conf_dir }}/calico/tigera-operator.yaml
+          changed_when: false
+
+        - name: Calico | operator rolled out
+          ansible.builtin.command: kubectl -n tigera-operator rollout status deployment/tigera-operator --timeout=300s
+          changed_when: false
+
+        - name: Calico | Installation resource (no Goldmane, no Whisker)
+          ansible.builtin.template:
+            src: templates/calico-installation.yaml.j2
+            dest: "{{ demigods_conf_dir }}/calico/installation.yaml"
+            mode: "0600"
+
+        - name: Calico | apply Installation
+          ansible.builtin.command: "kubectl apply -f {{ demigods_conf_dir }}/calico/installation.yaml"
+          register: demigods_calico_install
+          changed_when: "'unchanged' not in demigods_calico_install.stdout"
+
+        - name: Calico | wait for tigerastatus/calico Available
+          ansible.builtin.command: kubectl get tigerastatus calico -o json
+          register: demigods_calico_status
+          until: >-
+            demigods_calico_status.rc == 0 and
+            ((demigods_calico_status.stdout | from_json).status.conditions | default([])
+              | selectattr('type', 'equalto', 'Available')
+              | selectattr('status', 'equalto', 'True') | list | length) > 0
+          retries: 90
+          delay: 10
+          changed_when: false
+          failed_when: false
+
+        - name: Calico | assert Available
+          ansible.builtin.assert:
+            that:
+              - demigods_calico_status.rc == 0
+              - >-
+                ((demigods_calico_status.stdout | from_json).status.conditions | default([])
+                  | selectattr('type', 'equalto', 'Available')
+                  | selectattr('status', 'equalto', 'True') | list | length) > 0
+            fail_msg: >-
+              Calico did not become Available ({{ demigods_calico_status.stderr | default('') | trim }}).
+              Check: kubectl get tigerastatus; kubectl -n calico-system get pods
+            success_msg: Calico is Available
+
+        - name: "Control plane | {{ inventory_hostname }} is Ready"
+          ansible.builtin.command: "kubectl wait --for=condition=Ready node/{{ inventory_hostname }} --timeout=300s"
+          changed_when: false
+
+    # --- join credentials ----------------------------------------------------
+    - name: Join | credentials for workers
+      tags: [join]
+      block:
+        - name: Join | create a short-lived bootstrap token
+          ansible.builtin.command: kubeadm token create --ttl 2h --description "demigods.yml worker join"
+          register: demigods_token
+          changed_when: true
+          no_log: true
+
+        - name: Join | CA certificate public key hash
+          ansible.builtin.shell: |
+            set -o pipefail
+            openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt \
+              | openssl pkey -pubin -outform der \
+              | openssl dgst -sha256 -hex | sed 's/^.* //'
+          args:
+            executable: /bin/bash
+          register: demigods_ca_hash_out
+          changed_when: false
+
+        - name: Join | publish facts to the worker play
+          ansible.builtin.set_fact:
+            demigods_join_token: "{{ demigods_token.stdout | trim }}"
+            demigods_ca_hash: "{{ demigods_ca_hash_out.stdout | trim }}"
+          no_log: true
+
+# -----------------------------------------------------------------------------
+# PLAY 3 - workers
+# -----------------------------------------------------------------------------
+- name: "Play 3 | Join workers"
+  hosts: workers
+  become: true
+  any_errors_fatal: true
+  gather_facts: false
+
+  tasks:
+    - name: Join | worker
+      tags: [join]
+      block:
+        - name: Join | already joined?
+          ansible.builtin.stat:
+            path: /etc/kubernetes/kubelet.conf
+          register: demigods_joined
+
+        - name: "Join | API VIP {{ control_plane_endpoint }} reachable from {{ inventory_hostname }}"
+          ansible.builtin.wait_for:
+            host: "{{ kube_vip_address }}"
+            port: "{{ kube_api_port }}"
+            timeout: 120
+
+        - name: Join | config directory
+          ansible.builtin.file:
+            path: "{{ demigods_conf_dir }}"
+            state: directory
+            mode: "0700"
+          when: not demigods_joined.stat.exists
+
+        - name: Join | render join configuration
+          ansible.builtin.template:
+            src: templates/kubeadm-join.yaml.j2
+            dest: "{{ kubeadm_join_config }}"
+            mode: "0600"
+          when: not demigods_joined.stat.exists
+          no_log: true
+
+        - name: "Join | kubeadm join {{ cluster_name }}"
+          ansible.builtin.command: "kubeadm join --config {{ kubeadm_join_config }}"
+          when: not demigods_joined.stat.exists
+          changed_when: true
+
+        - name: Join | remove join configuration (contains a token)
+          ansible.builtin.file:
+            path: "{{ kubeadm_join_config }}"
+            state: absent
+
+        - name: Join | kubelet active
+          ansible.builtin.systemd_service:
+            name: kubelet
+            state: started
+            enabled: true
+
+# -----------------------------------------------------------------------------
+# PLAY 4 - labels, verification, kubeconfig export
+# -----------------------------------------------------------------------------
+- name: "Play 4 | Finalize and verify demigods"
+  hosts: control_plane
+  become: true
+  any_errors_fatal: true
+  gather_facts: false
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+
+  tasks:
+    - name: Finalize | nodes and labels
+      tags: [verify, labels]
+      block:
+        - name: Finalize | all five nodes registered
+          ansible.builtin.command: kubectl get nodes -o name
+          register: demigods_nodes
+          until: demigods_nodes.stdout_lines | length == groups['demigods'] | length
+          retries: 30
+          delay: 10
+          changed_when: false
+
+        - name: Finalize | all nodes Ready
+          ansible.builtin.command: kubectl wait --for=condition=Ready node --all --timeout=600s
+          changed_when: false
+
+        - name: Finalize | topology + role labels
+          ansible.builtin.command: >-
+            kubectl label node {{ item }} --overwrite
+            topology.kubernetes.io/region={{ topology_region }}
+            topology.kubernetes.io/zone={{ topology_zone }}
+            {{ storage_label_key }}={{ hostvars[item].storage_node | bool | lower }}
+            {% if item in groups['workers'] %}node-role.kubernetes.io/worker={% endif %}
+          loop: "{{ groups['demigods'] }}"
+          register: demigods_label
+          changed_when: "'labeled' in demigods_label.stdout and 'not labeled' not in demigods_label.stdout"
+
+        - name: Finalize | read labels back
+          ansible.builtin.command: kubectl get nodes -o json
+          register: demigods_nodes_json
+          changed_when: false
+
+        - name: Finalize | assert labels, IPs and podCIDRs
+          vars:
+            node: "{{ (demigods_nodes_json.stdout | from_json)['items'] | selectattr('metadata.name', 'equalto', item) | first }}"
+            internal_ip: "{{ node.status.addresses | selectattr('type', 'equalto', 'InternalIP') | map(attribute='address') | first }}"
+          ansible.builtin.assert:
+            that:
+              - node.metadata.labels['topology.kubernetes.io/region'] == topology_region
+              - node.metadata.labels['topology.kubernetes.io/zone'] == topology_zone
+              - node.metadata.labels[storage_label_key] == (hostvars[item].storage_node | bool | lower | string)
+              - internal_ip == hostvars[item].node_ip
+              - node.spec.podCIDR is defined
+              - node.spec.podCIDR.startswith(pod_cidr_prefix)
+              - node.spec.podCIDR.endswith('/' ~ pod_block_size)
+            fail_msg: "Node {{ item }} labels/addressing are wrong: {{ node.metadata.labels }} {{ internal_ip }} {{ node.spec.podCIDR | default('none') }}"
+            quiet: true
+          loop: "{{ groups['demigods'] }}"
+
+    - name: Verify | Calico topology
+      tags: [verify, calico]
+      block:
+        - name: Verify | Calico IP pools
+          ansible.builtin.command: kubectl get ippools.projectcalico.org -o json
+          register: demigods_ippools
+          changed_when: false
+
+        - name: Verify | single pool 10.253.0.0/23 with /26 blocks
+          vars:
+            pools: "{{ (demigods_ippools.stdout | from_json)['items'] }}"
+          ansible.builtin.assert:
+            that:
+              - pools | length == 1
+              - pools[0].metadata.name == calico_ippool_name
+              - pools[0].spec.cidr == pod_cidr
+              - pools[0].spec.blockSize | int == pod_block_size
+            fail_msg: "Unexpected IP pools: {{ pools | map(attribute='spec') | list }}"
+
+        - name: Verify | service ClusterIPs come from the service network
+          ansible.builtin.command: kubectl get svc -A -o json
+          register: demigods_svcs
+          changed_when: false
+
+        - name: "Verify | kubernetes = {{ service_api_ip }}, kube-dns = {{ service_dns_ip }}"
+          vars:
+            svc_items: "{{ (demigods_svcs.stdout | from_json)['items'] }}"
+            api_ip: >-
+              {{ svc_items | selectattr('metadata.namespace', 'equalto', 'default')
+                 | selectattr('metadata.name', 'equalto', 'kubernetes')
+                 | map(attribute='spec.clusterIP') | first | default('missing') }}
+            dns_ip: >-
+              {{ svc_items | selectattr('metadata.namespace', 'equalto', 'kube-system')
+                 | selectattr('metadata.name', 'equalto', 'kube-dns')
+                 | map(attribute='spec.clusterIP') | first | default('missing') }}
+          ansible.builtin.assert:
+            that:
+              - api_ip == service_api_ip
+              - dns_ip == service_dns_ip
+            fail_msg: "Expected kubernetes={{ service_api_ip }} kube-dns={{ service_dns_ip }}; got {{ api_ip }} / {{ dns_ip }}"
+
+        - name: Verify | Goldmane and Whisker are not installed
+          ansible.builtin.shell: |
+            set -o pipefail
+            { kubectl get goldmanes.operator.tigera.io,whiskers.operator.tigera.io -A --no-headers 2>/dev/null;
+              kubectl get pods -A --no-headers 2>/dev/null | grep -Ei 'goldmane|whisker'; } | wc -l
+          args:
+            executable: /bin/bash
+          register: demigods_observability
+          changed_when: false
+          failed_when: demigods_observability.stdout | int != 0
+
+        - name: Verify | kube-vip static pod running
+          ansible.builtin.command: >-
+            kubectl -n kube-system get pod kube-vip-{{ inventory_hostname }}
+            -o jsonpath={.status.phase}
+          register: demigods_kv_phase
+          until: demigods_kv_phase.stdout == 'Running'
+          retries: 12
+          delay: 5
+          changed_when: false
+
+    - name: Verify | pod network smoke test
+      tags: [verify, netcheck]
+      block:
+        - name: Netcheck | render DaemonSet
+          ansible.builtin.template:
+            src: templates/netcheck.yaml.j2
+            dest: "{{ demigods_conf_dir }}/netcheck.yaml"
+            mode: "0600"
+
+        - name: Netcheck | deploy
+          ansible.builtin.command: "kubectl apply -f {{ demigods_conf_dir }}/netcheck.yaml"
+          changed_when: true
+
+        - name: Netcheck | rolled out on every node
+          ansible.builtin.command: "kubectl -n {{ netcheck_namespace }} rollout status daemonset/netcheck --timeout=300s"
+          changed_when: false
+
+        - name: Netcheck | pod placement and IPs
+          ansible.builtin.command: "kubectl -n {{ netcheck_namespace }} get pods -l app=netcheck -o json"
+          register: demigods_netcheck_pods
+          changed_when: false
+
+        - name: Netcheck | collect pod facts
+          ansible.builtin.set_fact:
+            demigods_netcheck: >-
+              {{ (demigods_netcheck_pods.stdout | from_json)['items']
+                 | map(attribute='metadata.name')
+                 | zip((demigods_netcheck_pods.stdout | from_json)['items'] | map(attribute='status.podIP'),
+                       (demigods_netcheck_pods.stdout | from_json)['items'] | map(attribute='spec.nodeName'))
+                 | list }}
+
+        - name: Netcheck | one pod per node, each with a 10.253.x address
+          ansible.builtin.assert:
+            that:
+              - demigods_netcheck | length == groups['demigods'] | length
+              - demigods_netcheck | map(attribute=2) | unique | length == groups['demigods'] | length
+              - demigods_netcheck | map(attribute=1) | select('match', pod_cidr_prefix | regex_escape) | list | length == groups['demigods'] | length
+
+        - name: Netcheck | per-node /26 block affinities
+          ansible.builtin.shell: |
+            set -o pipefail
+            kubectl get blockaffinities.projectcalico.org -o json 2>/dev/null \
+              || kubectl get blockaffinities.crd.projectcalico.org -o json
+          args:
+            executable: /bin/bash
+          register: demigods_blocks
+          until: >-
+            (demigods_blocks.stdout | default('{"items":[]}', true) | from_json)['items']
+            | map(attribute='spec.node') | unique | length == groups['demigods'] | length
+          retries: 30
+          delay: 10
+          changed_when: false
+
+        - name: Netcheck | every block is a /26 inside the pod network
+          ansible.builtin.assert:
+            that:
+              - item.spec.cidr.startswith(pod_cidr_prefix)
+              - item.spec.cidr.endswith('/' ~ pod_block_size)
+            quiet: true
+          loop: "{{ (demigods_blocks.stdout | from_json)['items'] }}"
+          loop_control:
+            label: "{{ item.spec.node }} -> {{ item.spec.cidr }}"
+
+        - name: Netcheck | pod-to-pod across every node
+          ansible.builtin.command: >-
+            kubectl -n {{ netcheck_namespace }} exec {{ item.0 }} --
+            sh -c 'for ip in {{ demigods_netcheck | map(attribute=1) | difference([item.1]) | join(" ") }};
+            do ping -c 1 -W 2 $ip >/dev/null || { echo "FAIL $ip"; exit 1; }; done; echo ok'
+          loop: "{{ demigods_netcheck }}"
+          loop_control:
+            label: "{{ item.2 }} ({{ item.1 }})"
+          changed_when: false
+
+        - name: Netcheck | cluster DNS resolves the API service
+          ansible.builtin.command: >-
+            kubectl -n {{ netcheck_namespace }} exec {{ demigods_netcheck[0][0] }} --
+            nslookup kubernetes.default.svc.{{ cluster_dns_domain }}
+          register: demigods_dns
+          until: demigods_dns.rc == 0
+          retries: 6
+          delay: 5
+          changed_when: false
+
+        - name: Netcheck | egress through OpenWRT (NAT outgoing)
+          ansible.builtin.command: >-
+            kubectl -n {{ netcheck_namespace }} exec {{ demigods_netcheck[0][0] }} --
+            ping -c 2 -W 2 {{ network_gateway }}
+          changed_when: false
+
+      always:
+        - name: Netcheck | clean up
+          ansible.builtin.command: "kubectl delete namespace {{ netcheck_namespace }} --ignore-not-found --wait=false"
+          when: not (netcheck_keep | bool)
+          changed_when: true
+
+    - name: Finalize | kubeconfig export
+      tags: [verify, kubeconfig]
+      block:
+        - name: "Kubeconfig | copy with context named {{ kube_context_name }}"
+          ansible.builtin.shell: |
+            set -o pipefail
+            install -m 0600 /etc/kubernetes/admin.conf {{ demigods_conf_dir }}/{{ cluster_name }}.kubeconfig
+            KUBECONFIG={{ demigods_conf_dir }}/{{ cluster_name }}.kubeconfig \
+              kubectl config rename-context kubernetes-admin@{{ cluster_name }} {{ kube_context_name }} >/dev/null 2>&1 || true
+          args:
+            executable: /bin/bash
+          changed_when: false
+
+        - name: Kubeconfig | fetch to ./artifacts
+          ansible.builtin.fetch:
+            src: "{{ demigods_conf_dir }}/{{ cluster_name }}.kubeconfig"
+            dest: "{{ playbook_dir }}/artifacts/{{ cluster_name }}.kubeconfig"
+            flat: true
+
+        - name: Finalize | node summary
+          ansible.builtin.command: >-
+            kubectl get nodes -o wide
+            -L topology.kubernetes.io/region,topology.kubernetes.io/zone,{{ storage_label_key }}
+          register: demigods_summary
+          changed_when: false
+
+        - name: Finalize | done
+          ansible.builtin.debug:
+            msg:
+              - "Cluster {{ cluster_name }} is up. API: https://{{ control_plane_endpoint }}"
+              - "Kubeconfig: {{ playbook_dir }}/artifacts/{{ cluster_name }}.kubeconfig (context: {{ kube_context_name }})"
+              - "{{ demigods_summary.stdout_lines }}"
