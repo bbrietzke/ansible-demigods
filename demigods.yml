@@ -186,44 +186,44 @@
       block:
         - name: Preflight | ARM64
           ansible.builtin.assert:
-            that: ansible_architecture == 'aarch64'
-            fail_msg: "{{ inventory_hostname }} is {{ ansible_architecture }}, expected aarch64."
+            that: ansible_facts['architecture'] == 'aarch64'
+            fail_msg: "{{ inventory_hostname }} is {{ ansible_facts['architecture'] }}, expected aarch64."
 
         - name: Preflight | Ubuntu
           ansible.builtin.assert:
-            that: ansible_distribution == 'Ubuntu'
+            that: ansible_facts['distribution'] == 'Ubuntu'
             fail_msg: "This playbook targets Ubuntu Server (26.04 LTS arm64)."
 
         - name: Preflight | warn if not Ubuntu 26.04
           ansible.builtin.debug:
-            msg: "Note: {{ inventory_hostname }} runs Ubuntu {{ ansible_distribution_version }}; tested target is 26.04."
-          when: ansible_distribution_version != '26.04'
+            msg: "Note: {{ inventory_hostname }} runs Ubuntu {{ ansible_facts['distribution_version'] }}; tested target is 26.04."
+          when: ansible_facts['distribution_version'] != '26.04'
 
         - name: Preflight | remember the primary interface
           ansible.builtin.set_fact:
-            demigods_iface: "{{ ansible_default_ipv4.interface }}"
+            demigods_iface: "{{ ansible_facts['default_ipv4'].interface }}"
 
         - name: "Preflight | network | address is {{ node_ip }}"
           ansible.builtin.assert:
-            that: ansible_default_ipv4.address == node_ip
+            that: ansible_facts['default_ipv4'].address == node_ip
             fail_msg: >-
-              {{ inventory_hostname }} has {{ ansible_default_ipv4.address }} on {{ demigods_iface }},
+              {{ inventory_hostname }} has {{ ansible_facts['default_ipv4'].address }} on {{ demigods_iface }},
               expected {{ node_ip }}. Check the OpenWRT static lease for {{ mac_address }}.
 
         - name: "Preflight | network | MAC is {{ mac_address }}"
           ansible.builtin.assert:
-            that: (ansible_default_ipv4.macaddress | lower) == (mac_address | lower)
+            that: (ansible_facts['default_ipv4'].macaddress | lower) == (mac_address | lower)
             fail_msg: >-
-              {{ inventory_hostname }} answers with MAC {{ ansible_default_ipv4.macaddress }},
+              {{ inventory_hostname }} answers with MAC {{ ansible_facts['default_ipv4'].macaddress }},
               inventory says {{ mac_address }}. The wrong Pi may be on this address.
 
         - name: "Preflight | network | netmask is {{ network_netmask }} (/26)"
           ansible.builtin.assert:
-            that: ansible_default_ipv4.netmask == network_netmask
+            that: ansible_facts['default_ipv4'].netmask == network_netmask
 
         - name: "Preflight | network | default gateway is {{ network_gateway }}"
           ansible.builtin.assert:
-            that: ansible_default_ipv4.gateway == network_gateway
+            that: ansible_facts['default_ipv4'].gateway == network_gateway
 
         - name: Preflight | network | DNS servers handed out by DHCP
           ansible.builtin.command: "resolvectl dns {{ demigods_iface }}"
@@ -383,7 +383,7 @@
 
         - name: OS | kernel module extras for this kernel (rbd, ceph, iscsi_tcp)
           ansible.builtin.apt:
-            name: "linux-modules-extra-{{ ansible_kernel }}"
+            name: "linux-modules-extra-{{ ansible_facts['kernel'] }}"
           register: demigods_mod_extra
           failed_when: false
 
@@ -413,7 +413,7 @@
         # --- swap -------------------------------------------------------------
         - name: OS | swap off now
           ansible.builtin.command: swapoff -a
-          when: ansible_swaptotal_mb | int > 0
+          when: ansible_facts['swaptotal_mb'] | int > 0
           changed_when: true
 
         - name: OS | remove swap from fstab
